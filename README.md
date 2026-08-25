@@ -1,12 +1,278 @@
 # 吉里吉里Z multi platform
 
+## GPU Canvas
+
+### 编译方法
+
+```bash
+cmake --build --preset x86-windows-win --config Release --target krkrz
+```
+
+### 测试脚本
+
+```tjs
+System.exitOnWindowClose = true;
+
+var win = new Window();
+win.width = 800;
+win.height = 600;
+win.caption = "我他妈直接用canvas绘制";
+win.visible = true;
+
+// steam测试，用canvas进行绘制的窗口可以正常呼出steam overlay
+// 避免了layer的懒加载从而导致窗口不刷新的问题
+// Plugins.link("krkrsteam-d.dll");
+
+// Canvas即时绘制接口，Node/Scene只保存逻辑状态
+// 真正的绘制是在OGLDrawDevice.onDraw中。
+class CanvasNode {
+    var parent = null;
+    var children = [];
+    var serial = 0;
+
+    var x = 0;
+    var y = 0;
+    var scaleX = 1.0;
+    var scaleY = 1.0;
+    var rotation = 0.0; // 角度
+    var z = 0;
+    var opacity = 1.0;
+    var visible = true;
+
+    function addChild(node) {
+        if (node.parent != null) node.parent.removeChild(node);
+        node.parent = this;
+        node.serial = children.count;
+        children.push(node);
+        children.sort(function(a, b) {
+            if (a.z != b.z) return a.z - b.z;
+            return a.serial - b.serial;
+        });
+        return node;
+    }
+
+    function removeChild(node) {
+        for (var i = 0; i < children.count; i++) {
+            if (children[i] == node) {
+                children.erase(i);
+                node.parent = null;
+                return;
+            }
+        }
+    }
+
+    // parent*local，数组格式为：[m11, m12, m21, m22, tx, ty]。
+    function makeWorldTransform(parentTransform) {
+        var c = Math.cos(rotation);
+        var s = Math.sin(rotation);
+        var a = c * scaleX;
+        var b = s * scaleX;
+        var d = c * scaleY;
+        var e = -s * scaleY;
+
+        return [
+            parentTransform[0] * a + parentTransform[2] * b,
+            parentTransform[1] * a + parentTransform[3] * b,
+            parentTransform[0] * e + parentTransform[2] * d,
+            parentTransform[1] * e + parentTransform[3] * d,
+            parentTransform[0] * x + parentTransform[2] * y + parentTransform[4],
+            parentTransform[1] * x + parentTransform[3] * y + parentTransform[5]
+        ];
+    }
+
+    function draw(canvas, parentTransform, parentOpacity) {
+        if (!visible || opacity <= 0.0) return;
+
+        var worldTransform = makeWorldTransform(parentTransform);
+        var worldOpacity = parentOpacity * opacity;
+
+        drawSelf(canvas, worldTransform, worldOpacity);
+        for (var i = 0; i < children.count; i++) {
+            children[i].draw(canvas, worldTransform, worldOpacity);
+        }
+    }
+
+    // Group 节点本身不画任何东西，Sprite子类要重写这个方法。
+    function drawSelf(canvas, transform, alpha) {}
+}
+
+class CanvasSprite extends CanvasNode {
+    var texture = null;
+    var shader = null;
+    var matrix = new Matrix32();
+
+    function drawSelf(canvas, transform, alpha) {
+        if (texture == null) return;
+
+        matrix.set(transform[0], transform[1], transform[2], transform[3],
+            transform[4], transform[5]);
+        canvas.matrix = matrix;
+
+        if (shader != null) {
+            shader.uOpacity = alpha;
+            canvas.drawTexture(texture, shader);
+        } else {
+            canvas.drawTexture(texture);
+        }
+    }
+}
+
+class CanvasScene {
+    var root = new CanvasNode();
+
+    function draw(canvas) {
+        root.draw(canvas, [1.0, 0.0, 0.0, 1.0, 0.0, 0.0], 1.0);
+    }
+}
+
+class oglDD extends Window.OGLDrawDevice {
+    var fadeShader = null;
+    var tex = null;
+    var off = null;
+    var phase = 0.0;
+
+    var offscreenScene = new CanvasScene();
+    var mainScene = new CanvasScene();
+    var offscreenGroup = new CanvasNode();
+    var movingGroup = new CanvasNode();
+
+    function oglDD() {
+        // 不要用Window.OGLDrawDevice，直接OGLDrawDevice就行，太坏了渡边老贼
+        super.OGLDrawDevice();
+    }
+
+    function onInit() {
+        tex = new Texture("22.jpg");
+        off = new Offscreen(512, 512);
+
+        // 透明度shader，底层没有透明度设置的接口，这里只能这么写
+        // 其他的类似：灰度、色相、亮度、对比度、染色，模糊、锐化、马赛克、描边，mask、规则图转场、溶解、扭曲，混合
+        // 应该也是要shader
+        fadeShader = new ShaderProgram(
+            "attribute vec2 a_pos;" +
+            "attribute vec2 a_texCoord;" +
+            "uniform mat4 a_modelMat4;" +
+            "uniform vec2 a_size;" +
+            "varying vec2 v_texCoord;" +
+            "void main() {" +
+            "  mat4 ortho = mat4(" +
+            "    vec4(2.0/a_size.x, 0.0, 0.0, 0.0)," +
+            "    vec4(0.0, -2.0/a_size.y, 0.0, 0.0)," +
+            "    vec4(0.0, 0.0, -1.0, 0.0)," +
+            "    vec4(-1.0, 1.0, 0.0, 1.0));" +
+            "  gl_Position = ortho * a_modelMat4 * vec4(a_pos, 0.0, 1.0);" +
+            "  v_texCoord = a_texCoord;" +
+            "}",
+            "precision mediump float;" +
+            "varying vec2 v_texCoord;" +
+            "uniform sampler2D s_tex0;" + // s_tex0类似↓，uniform声明的都是
+            "uniform float uOpacity;" + // 这里的uOpacity对象会映射到tjs上可进行设置
+            "void main() {" +
+            "  vec4 color = texture2D(s_tex0, v_texCoord);" +
+            "  color.a *= uOpacity;" +
+            "  gl_FragColor = color;" +
+            "}",
+            0, 0
+        );
+
+        // 父子关系1：offscreenScene->offscreenGroup->sourceSprite。
+        // 移动offscreenGroup时，sourceSprite会跟随它。
+        offscreenGroup.x = 0;
+        offscreenGroup.y = 0;
+        offscreenScene.root.addChild(offscreenGroup);
+
+        var sourceSprite = new CanvasSprite();
+        sourceSprite.texture = tex;
+        sourceSprite.x = 106;
+        sourceSprite.y = 157;
+        // 22.jpg is 600x450. Fit it into the remaining 406x406 FBO area.
+        sourceSprite.scaleX = 406.0 / 600.0;
+        sourceSprite.scaleY = 406.0 / 600.0;
+        offscreenGroup.addChild(sourceSprite);
+
+        // 父子关系2：mainScene->movingGroup->offscreenSprite。
+        // 动画修改movingGroup，子图片会同时继承位移和透明度。
+        movingGroup.z = 100;
+        mainScene.root.addChild(movingGroup);
+
+        var offscreenSprite = new CanvasSprite();
+        offscreenSprite.texture = off;
+        offscreenSprite.shader = fadeShader;
+        movingGroup.addChild(offscreenSprite);
+    }
+
+    function onDraw() {
+        if (tex == null || off == null || fadeShader == null) return;
+
+        var canvas = this.canvas;
+
+        // 先把子场景画到离屏 FBO。
+        canvas.renderTarget = off;
+        canvas.blendMode = 1; // bmOpaque
+        canvas.clear(0xff203050);
+        offscreenScene.draw(canvas);
+
+        // 然后将离屏画面作为movingGroup的子节点绘制到窗口。
+        canvas.renderTarget = null;
+        canvas.blendMode = 2; // bmAlpha
+        canvas.clear(0xff202020);
+        mainScene.draw(canvas);
+    }
+
+    function updateScene(dt) {
+        phase += dt * 0.0022;
+        movingGroup.x = 144 + Math.sin(phase) * 110;
+        movingGroup.y = 44 + Math.cos(phase * 0.7) * 35;
+        movingGroup.opacity = 0.15 + (Math.sin(phase * 1.4) + 1.0) * 0.425;
+    }
+}
+
+var ogl = new oglDD();
+ogl.createCanvas();
+
+var lastTick = -1;
+function onAnimationTimer() {
+    // 窗口不可用（关了）就别调用定时器了
+    if (!isvalid win) {
+        timer.enabled = false;
+        return;
+    }
+
+    var tick = System.getTickCount();
+    if (lastTick < 0) lastTick = tick;
+    var dt = tick - lastTick;
+    lastTick = tick;
+    if (dt > 100) dt = 100;
+
+    ogl.updateScene(dt);
+    win.requestUpdate();
+}
+
+// 应该能改用addContinuousHandler，不过估计没啥用，差不多的玩意
+var timer = new Timer(onAnimationTimer, "");
+timer.interval = 16;
+timer.enabled = true;
+
+win.drawDevice = ogl;
+
+// 关闭窗口时把timer也停了
+win.onCloseQuery = function(canClose) {
+    timer.enabled = false;
+    System.terminate();
+};
+```
+
+### 运行要求
+
+libEGL.dll 和 libGLESv2.dll 支持，放到 exe 同目录下。
+
 ## 概要
 
 マルチプラットフォーム展開を想定した吉里吉里Zです
 
-・システム基本制御は SDL3 を使います
-・OpenGLベース描画機構を持ちます Canvas/Screen/Texture/Shader
-・極力外部ライブラリを参照する形で構築されています。
+- システム基本制御は SDL3 を使います
+- OpenGLベース描画機構を持ちます Canvas/Screen/Texture/Shader
+- 極力外部ライブラリを参照する形で構築されています。
 
 外部ライブラリの参照には vcpkg を利用しています。
 SDL3 は最新版を利用する関係で FettchContents で処理されます。
@@ -59,7 +325,7 @@ export VCPKG_ROOT='c:\work\vcpkg'
 
 git clone 後 submodule 更新しておいてください
 
-```
+```bash
 git submodule update --init
 ```
 
@@ -82,7 +348,6 @@ cmake --build build/x86-windows
 ビルドに必要な定義が行われた Makefile が準備されていいます。
 make が使える環境ではこちらが利用可能です
 
-
 ```bash
 # 構築対象 preset設定（未定義時はOSで自動判定）
 export PRESET=x86-windows
@@ -99,15 +364,14 @@ export CMAKEOPT="-DKRKRZ_USE_SJIS=ON"
 make prebuild
 
 # cmake でビルド
-make build 
+make build
 
 # サンプル実行
 make run
 
 # インストール処理
 INSTALL_PREFIX=install make install
-
-```	
+```
 
 ### ビルド設定
 
@@ -115,9 +379,11 @@ INSTALL_PREFIX=install make install
 
 ビルド用の以下の特殊な CMake変数があります
 
-KRKRZ_VARIANT=WIN    旧来のWindows版準拠で構築します
-KRKRZ_VARIANT=SDL    SDLバージョンで作成します（デフォルト）
-KRKRZ_VARIANT=LIB    ライブラリ版KRKRZを作成します
+| 変数 | 説明 |
+|------|------|
+| `KRKRZ_VARIANT=WIN` | 旧来のWindows版準拠で構築します |
+| `KRKRZ_VARIANT=SDL` | SDLバージョンで作成します（デフォルト） |
+| `KRKRZ_VARIANT=LIB` | ライブラリ版KRKRZを作成します |
 
 KRKRZ_VARIANT=SDL / LIB では、旧来の Windows版固有の機能が排除
 された GENERICバージョンの吉里吉里になります。
@@ -131,19 +397,18 @@ tp_stub/krkrz.cmake を使う場合は KRKRZ_VARIANT が定義されている場
 ※特に変数指定がない場合、tp_stub.h は __WINVER__ を定義して
 旧WIN版互換あわせでの動作になります。
 
-
 ### そのほか特殊変数
 
-MASTER  
-    ビルド時に定義されているとログレベルが WARNING で固定になります（INFOログがコンソール表示されなくなります）
+**MASTER**
+: ビルド時に定義されているとログレベルが WARNING で固定になります（INFOログがコンソール表示されなくなります）
 
     未定義時は、起動時ログレベルが Release 版は INFO、Debug版は DEBUG になります。
     起動時オプション -loglevel=ERROR,WARNING,INFO,DEBUG,VERBOSE で変更可能になります
 
-KRKRZ_REPL  
-    対話型 TJS REPL 機能のビルドスイッチ。Win / Mac / Linux ではデフォルト ON、
+**KRKRZ_REPL**
+: 対話型 TJS REPL 機能のビルドスイッチ。Win / Mac / Linux ではデフォルト ON、
     それ以外 (Android, iOS) では OFF。詳細は [doc/REPL.md](doc/REPL.md) 参照。
-    機能ON の場合は起動時オプション -repl でコンソールで　REPL が起動します。
+    機能ON の場合は起動時オプション -repl でコンソールで REPL が起動します。
 
 ログ処理の仕組み、ファイル出力、TJS から見た API 等は
 [doc/Logging.md](doc/Logging.md) を参照してください。
@@ -159,12 +424,14 @@ make run
 
 WINVER で OpenGL 機能動作時は以下のファイル構成が必要になります
 
-    plugin/ プラグインフォルダ
-      libEGL.dll        OpenGL の egl用DLL
-      libGLESv2.dll     OpenGL の GLES2用DLL
-    plugin64/ プラグインフォルダ 64bit
-      libEGL.dll        OpenGL の egl用DLL
-      libGLESv2.dll     OpenGL の GLES2用DLL
+```
+plugin/                     プラグインフォルダ
+  libEGL.dll                OpenGL の egl用DLL
+  libGLESv2.dll             OpenGL の GLES2用DLL
+plugin64/                   プラグインフォルダ 64bit
+  libEGL.dll                OpenGL の egl用DLL
+  libGLESv2.dll             OpenGL の GLES2用DLL
+```
 
 SDL 版は OS側で OpenGLES 実装が存在する場合はそれが使われますが
 無い場合は同様の DLL が必要になります
@@ -279,9 +546,10 @@ TJS2 / KAG (.ks) のシンタックスハイライトも同拡張に同梱され
 KAG (.ks) 行への BP は仕様上対応不可ですが、`[iscript]...[endscript]` 内の
 TJS なら BP 設置可能です。
 
-# その他情報
+## その他情報
 
-自動生成ファイル
+### 自動生成ファイル
+
 吉里吉里Z本体にはいくつかの自動生成ファイルが存在します。
 自動生成ファイルは直接編集せず、生成元のファイルを編集します。
 生成には主にbatファイルとperlが使用されているので、perlのインストールが必要です。
@@ -289,22 +557,30 @@ TJS なら BP 設置可能です。
 
 tjs2/syntax/compile.bat で以下のファイルが生成されます。
 
-tjs.tab.cpp/tjs.tab.hpp : tjs.y
-tjsdate.tab.cpp/tjsdate.tab.hpp : tjsdate.y
-tjspp.tab.cpp/tjspp.tab.hpp : tjspp.y
-tjsDateWordMap.cc : gen_wordtable.bat
+| 生成ファイル | 生成元 |
+|-------------|--------|
+| tjs.tab.cpp / tjs.tab.hpp | tjs.y |
+| tjsdate.tab.cpp / tjsdate.tab.hpp | tjsdate.y |
+| tjspp.tab.cpp / tjspp.tab.hpp | tjspp.y |
+| tjsDateWordMap.cc | gen_wordtable.bat |
 
 これらのファイルの生成には bison が必要です。
 bison には libiconv2.dll libintl3.dll regex2.dll が必要なので一緒にインストールする必要があります。
-http://gnuwin32.sourceforge.net/packages/bison.htm
-http://gnuwin32.sourceforge.net/packages/libintl.htm
-http://gnuwin32.sourceforge.net/packages/libiconv.htm
-http://gnuwin32.sourceforge.net/packages/regex.htm
+
+- http://gnuwin32.sourceforge.net/packages/bison.htm
+- http://gnuwin32.sourceforge.net/packages/libintl.htm
+- http://gnuwin32.sourceforge.net/packages/libiconv.htm
+- http://gnuwin32.sourceforge.net/packages/regex.htm
 
 visual/glgen/gengl.bat で以下のファイルが生成されます。
-tvpgl.c/tvpgl.h : maketab.c/tvpps.c
+
+| 生成ファイル | 生成元 |
+|-------------|--------|
+| tvpgl.c / tvpgl.h | maketab.c / tvpps.c |
 
 base/win32/makestub.bat で以下のファイルが生成されます。
-FuncStubs.cpp/FuncStubs.h : makestub.pl内で指定されたヘッダーファイル内のTJS_EXP_FUNC_DEF/TVP_GL_FUNC_PTR_EXTERN_DECLマクロで記述された関数
-tp_stub.cpp/tp_stub.h : 同上
 
+| 生成ファイル | 生成元 |
+|-------------|--------|
+| FuncStubs.cpp / FuncStubs.h | makestub.pl内で指定されたヘッダーファイル内のTJS_EXP_FUNC_DEF/TVP_GL_FUNC_PTR_EXTERN_DECLマクロで記述された関数 |
+| tp_stub.cpp / tp_stub.h | 同上 |
