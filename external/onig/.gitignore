@@ -5,8 +5,6 @@ stamp-h1
 configure
 config.status
 config.log
-config.h
-config.h.in
 onig-config
 libtool
 aclocal.m4

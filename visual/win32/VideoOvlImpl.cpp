@@ -76,6 +76,67 @@ public:
 
 static tTVPVideoModule *TVPMovieVideoModule = NULL;
 
+// Legacy Flash playback is supplied by a separate optional DLL.  Keep its
+// loader separate from krmovie because krflash only implements the basic
+// overlay entry point.
+class tTVPFlashVideoModule
+{
+	tTVPPluginHolder *Holder;
+	HMODULE Handle;
+	tGetAPIVersion procGetAPIVersion;
+	tGetVideoOverlayObject procGetVideoOverlayObject;
+	tTVPV2LinkProc procV2Link;
+	tTVPV2UnlinkProc procV2Unlink;
+	bool Linked;
+
+public:
+	tTVPFlashVideoModule()
+		: Holder(NULL), Handle(NULL), procGetAPIVersion(NULL),
+		procGetVideoOverlayObject(NULL), procV2Link(NULL), procV2Unlink(NULL),
+		Linked(false)
+	{
+		Holder = new tTVPPluginHolder(TJS_W("krflash.dll"));
+		if(Holder->GetLocalName().IsEmpty()) return;
+
+		Handle = LoadLibrary((const wchar_t *)Holder->GetLocalName().c_str());
+		if(!Handle) return;
+
+		procGetAPIVersion = (tGetAPIVersion)GetProcAddress(Handle, "GetAPIVersion");
+		procGetVideoOverlayObject = (tGetVideoOverlayObject)GetProcAddress(Handle, "GetVideoOverlayObject");
+		procV2Link = (tTVPV2LinkProc)GetProcAddress(Handle, "V2Link");
+		procV2Unlink = (tTVPV2UnlinkProc)GetProcAddress(Handle, "V2Unlink");
+
+		DWORD version = 0;
+		if(!procGetAPIVersion || !procGetVideoOverlayObject || !procV2Link ||
+			!procV2Unlink || (procGetAPIVersion(&version), version != TVP_KRMOVIE_VER) ||
+			FAILED(procV2Link(TVPGetFunctionExporter())))
+		{
+			FreeLibrary(Handle);
+			Handle = NULL;
+			procGetVideoOverlayObject = NULL;
+			return;
+		}
+		Linked = true;
+	}
+
+	~tTVPFlashVideoModule()
+	{
+		if(Linked) procV2Unlink();
+		if(Handle) FreeLibrary(Handle);
+		if(Holder) delete Holder;
+	}
+
+	bool IsAvailable() const { return Handle != NULL; }
+	void GetVideoOverlayObject(HWND callbackwin, IStream *stream,
+		const wchar_t *streamname, const wchar_t *type, unsigned __int64 size,
+		iTVPVideoOverlay **out)
+	{
+		procGetVideoOverlayObject(callbackwin, stream, streamname, type, size, out);
+	}
+};
+
+static tTVPFlashVideoModule *TVPFlashVideoModule = NULL;
+
 tTVPVideoModule::tTVPVideoModule()
 	: Holder(NULL), Handle(NULL), procGetAPIVersion(NULL), procV2Link(NULL),
 	procV2Unlink(NULL), Linked(false)
@@ -151,6 +212,19 @@ static tTVPVideoModule *TVPGetMovieVideoModule()
 	return TVPMovieVideoModule;
 }
 
+static tTVPFlashVideoModule *TVPGetFlashVideoModule()
+{
+	if(TVPFlashVideoModule == NULL)
+	{
+		tTVPFlashVideoModule *module = new tTVPFlashVideoModule();
+		if(module->IsAvailable())
+			TVPFlashVideoModule = module;
+		else
+			delete module;
+	}
+	return TVPFlashVideoModule;
+}
+
 //---------------------------------------------------------------------------
 static std::vector<tTJSNI_VideoOverlay *> TVPVideoOverlayVector;
 //---------------------------------------------------------------------------
@@ -185,6 +259,8 @@ static void TVPShutdownVideoOverlay()
 		// point for an optional video backend at application shutdown.
 		TVPMovieVideoModule = NULL;
 	}
+	// Do not explicitly unload the optional Flash backend during process exit.
+	TVPFlashVideoModule = NULL;
 }
 static tTVPAtExit TVPShutdownVideoOverlayAtExit
 	(TVP_ATEXIT_PRI_PREPARE, TVPShutdownVideoOverlay);
@@ -275,10 +351,23 @@ void tTJSNI_VideoOverlay::Open(const ttstr &_name)
 	}
 
 	IStream *istream = NULL;
-	long size;
+	long size = 0;
 	ttstr ext = TVPExtractStorageExt(name).c_str();
 	ext.ToLowerCase();
+	bool flash = false;
+	tTVPFlashVideoModule *flashModule = NULL;
+	if(ext == TJS_W(".swf"))
+		flashModule = TVPGetFlashVideoModule();
 
+	if(flashModule)
+	{
+		flash = true;
+		if(LocalTempStorageHolder)
+			delete LocalTempStorageHolder, LocalTempStorageHolder = NULL;
+		ttstr placed = TVPSearchPlacedPath(name);
+		LocalTempStorageHolder = new tTVPLocalTempStorageHolder(placed);
+	}
+	else
 	{
 		// prepate IStream
 		tTJSBinaryStream *stream0 = NULL;
@@ -301,8 +390,15 @@ void tTJSNI_VideoOverlay::Open(const ttstr &_name)
 	// create video overlay object
 	try
 	{
-		tTVPVideoModule *module = TVPGetMovieVideoModule();
+		if(flash)
 		{
+			flashModule->GetVideoOverlayObject(EventQueue.GetOwner(), NULL,
+				(LocalTempStorageHolder->GetLocalName() + param).c_str(), ext.c_str(), 0,
+				&VideoOverlay);
+		}
+		else
+		{
+			tTVPVideoModule *module = TVPGetMovieVideoModule();
 			if(Mode == vomLayer)
 				module->GetVideoLayerObject(EventQueue.GetOwner(), istream, name.c_str(), ext.c_str(), size, &VideoOverlay);
 			else if(Mode == vomMixer)
@@ -313,7 +409,7 @@ void tTJSNI_VideoOverlay::Open(const ttstr &_name)
 				module->GetVideoOverlayObject(EventQueue.GetOwner(), istream, name.c_str(), ext.c_str(), size, &VideoOverlay);
 		}
 
-		if( (Mode == vomOverlay) || (Mode == vomMixer) || (Mode == vomMFEVR) )
+		if( flash || (Mode == vomOverlay) || (Mode == vomMixer) || (Mode == vomMFEVR) )
 		{
 			ResetOverlayParams();
 		}
